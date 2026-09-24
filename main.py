@@ -4,9 +4,10 @@ import logging
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 import dotenv
+import openai
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -44,6 +45,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.ai_models.ai_utils.response_types import TextTokenCostResponse
 from forecasting_tools.ai_models.general_llm import ModelInputType
+from forecasting_tools.data_models.forecast_report import ForecastReport
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -100,6 +102,23 @@ class FreeTierPacedLlm(GeneralLlm):
             start = in_window[0][0] + cls.WINDOW_SECONDS
         bookings.append((start, tokens))
         return start
+
+
+def cap_words(text: str, max_words: int) -> str:
+    """Trim text to at most `max_words` words, marking the cut with " ...".
+
+    Args:
+        text: Text to trim.
+        max_words: Maximum number of words kept.
+
+    Returns:
+        The stripped text unchanged when short enough, else its first
+        `max_words` words joined by single spaces plus " ...".
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]) + " ..."
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -185,6 +204,79 @@ class SummerTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    COMMENT_MAX_WORDS = 100
+    COMMENT_MIN_WORDS = 20
+
+    def __init__(
+        self, *args: Any, publish_summarized_comments: bool = False, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.publish_summarized_comments = publish_summarized_comments
+
+    ##################################### COMMENT #####################################
+
+    async def _run_individual_question(
+        self, question: MetaculusQuestion
+    ) -> ForecastReport:
+        """Forecast one question, then publish it with a short rationale comment.
+
+        vezocontrol: Metaculus penalizes long comments, so the returned report
+        keeps the full explanation (logs, saved JSON) and only a summarized
+        rationale is posted. Build the bot with `publish_reports_to_metaculus`
+        off so the parent class does not also post the full report.
+
+        Args:
+            question: The question to forecast.
+
+        Returns:
+            The full forecast report.
+        """
+        report = await super()._run_individual_question(question)
+        if self.publish_summarized_comments:
+            comment = await self._summarized_comment(report)
+            await report.model_copy(
+                update={"explanation": comment}
+            ).publish_report_to_metaculus(metaculus_client=self.metaculus_client)
+        return report
+
+    async def _summarized_comment(self, report: ForecastReport) -> str:
+        """Condense the forecasters' reasoning into a short rationale comment.
+
+        Falls back to the first forecaster's reasoning, capped at the same
+        length, when the summary call fails or comes back truncated twice.
+
+        Args:
+            report: The full forecast report.
+
+        Returns:
+            Markdown comment text of at most `COMMENT_MAX_WORDS` words.
+        """
+        prompt = clean_indents(
+            f"""
+            Below is the reasoning of several forecasters on this question:
+            {report.question.question_text}
+
+            Their aggregated forecast is: {report.make_readable_prediction(report.prediction)}
+
+            Write the rationale for this forecast in at most {self.COMMENT_MAX_WORDS} words of plain prose, with no headings or lists: the base rate or status quo it rests on and the main evidence that moved it. Output only the rationale.
+
+            {report.forecast_rationales}
+            """
+        )
+        llm = self.get_llm("default", "llm")
+        rationale = ""
+        try:
+            # Gemma sometimes stops after a few words; one more try usually fixes it.
+            for _ in range(2):
+                rationale = await llm.invoke(prompt)
+                if len(rationale.split()) >= self.COMMENT_MIN_WORDS:
+                    break
+        except (openai.APIError, ValueError) as error:
+            logger.warning(f"Rationale summary call failed ({type(error).__name__})")
+        if len(rationale.split()) < self.COMMENT_MIN_WORDS:
+            logger.warning("No usable rationale summary; posting the first reasoning")
+            rationale = report.first_rationale.split("\n", 1)[-1]
+        return f"# Rationale\n{cap_words(rationale, self.COMMENT_MAX_WORDS)}"
 
     ##################################### RESEARCH #####################################
 
@@ -731,8 +823,11 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
+        # vezocontrol: the bot posts a summarized comment itself (Metaculus
+        # penalizes long comments); full reports go to reports/ as a run artifact.
+        publish_reports_to_metaculus=False,
+        publish_summarized_comments=publish_to_metaculus,
+        folder_to_save_reports_to="reports",
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         # vezocontrol (v2 control bot): every LLM purpose is pinned to one free
