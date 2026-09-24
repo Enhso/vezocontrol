@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -40,9 +42,64 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
+from forecasting_tools.ai_models.ai_utils.response_types import TextTokenCostResponse
+from forecasting_tools.ai_models.general_llm import ModelInputType
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+class FreeTierPacedLlm(GeneralLlm):
+    """GeneralLlm that paces calls under Google's free-tier input-token quota.
+
+    OpenRouter sends `:free` Gemma on this account through a BYOK Google AI Studio
+    key on Google's free tier: 16,000 input tokens per minute per model. The
+    template fires five ~8k-token forecasts plus parser calls at once, so unpaced
+    calls fail with 429s. Each call books a start time in a shared 60 s window
+    before it is sent. The budget keeps headroom because the count is a tiktoken
+    estimate, not Gemma's tokenizer.
+    """
+
+    TOKENS_PER_MINUTE = 12_000
+    WINDOW_SECONDS = 60.0
+    _bookings: deque[tuple[float, int]] = deque()
+
+    async def _mockable_direct_call_to_model(
+        self, prompt: ModelInputType
+    ) -> TextTokenCostResponse:
+        start = self.book(self.input_to_tokens(prompt), time.monotonic())
+        await asyncio.sleep(start - time.monotonic())
+        return await super()._mockable_direct_call_to_model(prompt)
+
+    @classmethod
+    def book(cls, tokens: int, now: float) -> float:
+        """Reserve the earliest start time that keeps the window under budget.
+
+        Bookings are first-come first-served, so start times never go backwards.
+
+        Args:
+            tokens: Estimated input tokens of the call.
+            now: Current monotonic time in seconds.
+
+        Returns:
+            Monotonic time at which the call may be sent. A call larger than the
+            whole budget waits for an empty window and goes alone.
+        """
+        bookings = cls._bookings
+        while bookings and bookings[0][0] <= now - cls.WINDOW_SECONDS:
+            bookings.popleft()
+        start = max(now, bookings[-1][0]) if bookings else now
+        while True:
+            in_window = [
+                (booked, n) for booked, n in bookings
+                if booked > start - cls.WINDOW_SECONDS
+            ]
+            used = sum(n for _, n in in_window)
+            if not in_window or used + tokens <= cls.TOKENS_PER_MINUTE:
+                break
+            start = in_window[0][0] + cls.WINDOW_SECONDS
+        bookings.append((start, tokens))
+        return start
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -678,18 +735,24 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # vezocontrol (v2 control bot): the only change from the template is
-        # pinning every LLM purpose to one free model, so the control costs $0.
+        # vezocontrol (v2 control bot): every LLM purpose is pinned to one free
+        # model, so the control costs $0, and paced under its free-tier quota.
+        # Extra tries absorb Google's intermittent 500s on large Gemma prompts
+        # and 429s when v1 shares the same quota.
         llms={
-            "default": GeneralLlm(
+            "default": FreeTierPacedLlm(
                 model="openrouter/google/gemma-4-31b-it:free",
                 temperature=0.3,
                 timeout=120,
-                allowed_tries=2,
+                allowed_tries=5,
             ),
-            "summarizer": "openrouter/google/gemma-4-31b-it:free",
+            "summarizer": FreeTierPacedLlm(
+                model="openrouter/google/gemma-4-31b-it:free"
+            ),
             "researcher": "asknews/news-summaries",
-            "parser": "openrouter/google/gemma-4-31b-it:free",
+            "parser": FreeTierPacedLlm(
+                model="openrouter/google/gemma-4-31b-it:free", allowed_tries=5
+            ),
         },
     )
 
