@@ -1,20 +1,59 @@
+# Tournament questions stay open for only ~3 hours and GitHub fires a
+# `*/20` cron far less often than that (roughly 5 times a day), so a single
+# `main.py` run per trigger misses most of them. Instead each run is a ~5h
+# "shift": it installs once, then loops `main.py` every 5 minutes (the bot
+# skips questions it has already forecasted) and dispatches its own successor
+# via workflow_dispatch before it ends, so coverage does not depend on cron
+# timing. The cron below is only a backstop in case a dispatch is ever missed.
 name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+    - cron: "*/30 * * * *"
 
-# Add concurrency group to prevent parallel runs
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
 
-
-# Daily job to run the simple forecast bot
 jobs:
+  # Scheduled triggers must not start a second shift on top of one already
+  # running (or about to run); workflow_dispatch triggers (the normal,
+  # self-chained path) always proceed.
+  guard:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          other_runs=$(gh run list --repo "${{ github.repository }}" \
+            --workflow=run_bot_on_tournament.yaml --json status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "pending" or .status == "waiting" or .status == "requested")] | length')
+          # This run itself is already counted as in_progress/queued, so
+          # more than one means a genuinely separate shift is active.
+          if [ "$other_runs" -gt 1 ]; then
+            echo "another shift is already running or queued ($other_runs), skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   forecast_job:
+    needs: [guard]
+    if: always() && (github.event_name != 'schedule' || needs.guard.outputs.skip != 'true')
+    # A dispatched successor waits here for the previous shift's job to finish
+    # instead of overlapping it: two overlapping main.py runs could
+    # double-forecast a question.
+    concurrency:
+      group: vezocontrol-shift
+      cancel-in-progress: false
     runs-on: ubuntu-latest # determines the machine that will run the job - keep as is
+    timeout-minutes: 350
     steps: # sets up the steps that will be run in order
       # setup repository with all necessary dependencies - keep as is
       - name: Check out repository
@@ -37,9 +76,29 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
-      - name: Run bot
+      - name: Run bot shift
         run: |
-          poetry run python main.py
+          # The runner's default `bash -e` would end the shift on the first
+          # failed iteration, so switch -e off.
+          set +e
+          set -uo pipefail
+          # Stop starting iterations after 300 min so the last one can finish
+          # inside the 350 min job timeout.
+          deadline=$(( $(date +%s) + 300 * 60 ))
+          iteration=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            iteration=$(( iteration + 1 ))
+            echo "::group::iteration $iteration"
+            poetry run python main.py
+            exit_code=$?
+            echo "::endgroup::"
+            if [ "$exit_code" -ne 0 ]; then
+              echo "::warning::iteration $iteration exited with code $exit_code"
+            fi
+            if [ "$(date +%s)" -lt "$deadline" ]; then
+              sleep 300
+            fi
+          done
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -60,3 +119,11 @@ jobs:
           path: reports/
           if-no-files-found: ignore
           retention-days: 90
+      - name: Dispatch successor shift
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "/repos/${{ github.repository }}/actions/workflows/run_bot_on_tournament.yaml/dispatches" \
+            -f ref=main
